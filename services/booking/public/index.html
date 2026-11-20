@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Prendre rendez-vous</title>
+  <link rel="stylesheet" href="/rendez-vous/style.css">
+  <script src="/rendez-vous/app.js" defer></script>
+</head>
+<body>
+  <main>
+    <h1>Prendre rendez-vous</h1>
+    <p class="intro">Choisissez un service, un jour et un créneau. Les champs marqués * sont obligatoires.</p>
+
+    <form id="booking-form" novalidate>
+      <div class="field">
+        <label for="service">Service *</label>
+        <select id="service" name="service" required>
+          <option value="">Chargement…</option>
+        </select>
+        <p class="error" data-for="service"></p>
+      </div>
+
+      <div class="row">
+        <div class="field">
+          <label for="date">Date *</label>
+          <input type="date" id="date" name="date" required>
+          <p class="error" data-for="date"></p>
+        </div>
+        <div class="field">
+          <label for="time">Créneau *</label>
+          <select id="time" name="time" required disabled>
+            <option value="">Choisissez d'abord une date</option>
+          </select>
+          <p class="error" data-for="time"></p>
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="name">Nom et prénom *</label>
+        <input type="text" id="name" name="name" required minlength="2" maxlength="80" autocomplete="name">
+        <p class="error" data-for="name"></p>
+      </div>
+
+      <div class="row">
+        <div class="field">
+          <label for="phone">Téléphone (WhatsApp) *</label>
+          <input type="tel" id="phone" name="phone" required maxlength="25" autocomplete="tel" placeholder="+33 6 12 34 56 78">
+          <p class="error" data-for="phone"></p>
+        </div>
+        <div class="field">
+          <label for="email">E-mail</label>
+          <input type="email" id="email" name="email" maxlength="254" autocomplete="email">
+          <p class="error" data-for="email"></p>
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="notes">Remarque</label>
+        <textarea id="notes" name="notes" rows="3" maxlength="500"></textarea>
+        <p class="error" data-for="notes"></p>
+      </div>
+
+      <!-- Champ piège anti-robots : caché aux humains, ne pas remplir. -->
+      <div class="hp" aria-hidden="true">
+        <label for="website">Ne pas remplir</label>
+        <input type="text" id="website" name="website" tabindex="-1" autocomplete="off">
+      </div>
+
+      <button type="submit" id="submit">Réserver</button>
+      <p id="status" role="status" aria-live="polite"></p>
+    </form>
+
+    <section id="confirmation" hidden>
+      <h2>Rendez-vous confirmé ✔</h2>
+      <p id="confirmation-text"></p>
+      <button type="button" id="again">Prendre un autre rendez-vous</button>
+    </section>
+  </main>
+</body>
+</html>

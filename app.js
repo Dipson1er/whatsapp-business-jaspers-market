@@ -16,7 +16,15 @@ const express = require('express');
 const config = require('./services/config');
 const Conversation = require('./services/conversation');
 const Message = require('./services/message');
+const { createBookingRouter } = require('./services/booking/router');
 const app = express();
+
+// Si le serveur est derrière un proxy (Heroku, Nginx…), décommentez la ligne
+// suivante pour que la limite de requêtes voie la vraie IP des clients.
+// app.set('trust proxy', 1);
+
+// Page et API de prise de rendez-vous (avant les lecteurs de corps du webhook)
+app.use(createBookingRouter());
 
 // Parse application/x-www-form-urlencoded
 app.use(
@@ -78,7 +86,8 @@ app.get('/', (req, res) => {
   res.json({
     message: 'Jasper\'s Market Server is running',
     endpoints: [
-      'POST /webhook - WhatsApp webhook endpoint'
+      'POST /webhook - WhatsApp webhook endpoint',
+      'GET /rendez-vous - Page de prise de rendez-vous'
     ]
   });
 });
