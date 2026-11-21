@@ -1,0 +1,478 @@
+---
+name: us-undervalued-growth-screener
+description: Autonomously screen NYSE, Nasdaq, and NYSE American operating-company stocks for undervalued-growth/GARP opportunities using forward same-basis valuation, driver-derived EPS/FCF forecasts, primary-source financial verification, SBC and dilution controls, sector and cycle normalization, auditable candidate-pool coverage, and fail-closed final reporting. Use when asked to find, screen, rank, or refresh US undervalued-growth stocks, including minimal requests with no ticker list or parameters.
+---
+
+# US Undervalued Growth Screener — v3.6 (Claude Code Direct-FMP)
+
+## Overview
+
+Run an end-to-end US undervalued-growth/GARP screen from a minimal request. Find companies whose EPS or FCF per share can compound enough to support attractive two- to three-year returns **without assuming multiple expansion**, while controlling for accounting basis, forecast construction, SBC, dilution, leverage, cyclicality, corporate actions, peer context, source freshness, and evidence quality.
+
+**Claude Code is the preferred execution environment.** In Claude Code, run the local direct-FMP pipeline once. The Python process performs bulk retrieval, persistent caching, FY1 normalization, liquidity calculation, four-lane discovery, and deterministic broad screening while keeping raw FMP payloads on disk and out of the model context. Claude reads only the compact run summary and selected candidate packets, then completes SEC/IR underwriting and the existing strict evaluation sequence.
+
+Treat a request such as **“use this skill to screen for undervalued-growth stocks” as complete**. Resolve defaults, collect current data, choose a viable acquisition path, checkpoint the work, repair obtainable blockers, and return the finished result in the same task. Never ask the user to supply a ticker list, API-plan details, output path, or a separate “continue” instruction unless the user explicitly narrows the scope.
+
+**Deep-dive budget and lane coverage:** The bounded direct-FMP path defaults to `max_deep_dive_candidates: 3`. Three selected names cannot represent all four research lanes. The default lane targets are core GARP 2, high-growth exception 1, quality near miss 1, and cyclical normalization 1 (five slots total). A three-name run prioritizes candidates across lanes; it does not promise one name per lane. For a five-slot lane-first selection, set `max_deep_dive_candidates: 5` in a local copy of `assets/claude-code-config.example.json` and rerun the bounded pipeline with that config. Eligible candidates and diversification preferences still determine actual lane representation. The separate full-snapshot path requires `full_snapshot_deep_dive_candidates: 5`. See `references/claude-code-execution.md` for selection and budget-change details.
+
+## Non-Negotiable Runtime Preflight
+
+Before reading or reusing any prior run artifact, verify the installed runtime:
+
+```bash
+python3 skills/us-undervalued-growth-screener/scripts/run_pipeline.py --version
+python3 skills/us-undervalued-growth-screener/scripts/screen_universe.py --version
+python3 skills/us-undervalued-growth-screener/scripts/build_discovery_pool.py --version
+python3 skills/us-undervalued-growth-screener/scripts/build_provider_prefilter_pool.py --version
+python3 skills/us-undervalued-growth-screener/scripts/normalize_estimates.py --version
+python3 skills/us-undervalued-growth-screener/scripts/manage_run_state.py --version
+python3 skills/us-undervalued-growth-screener/scripts/evaluate_candidates.py --version
+python3 skills/us-undervalued-growth-screener/scripts/prepublish_audit.py --version
+python3 skills/us-undervalued-growth-screener/scripts/bundle_run_artifacts.py --version
+```
+
+Every command must report the same metadata:
+
+```text
+skill_version = 3.6.1
+schema_version = 3
+contract_revision = 3.5
+runtime_fingerprint = ug-v3.6.1-claude-code-direct-fmp-20260830
+```
+
+Discard and regenerate any audit, checkpoint, or snapshot whose runtime metadata differs. Do not mix scripts, assets, or run artifacts from v3.1 through v3.5. A stale or cached same-name skill is a hard execution failure, not a warning.
+
+## Autonomous Completion Contract
+
+For a minimal request, perform all of the following without handing control back to the user:
+
+1. Fix `analysis_as_of` and the latest completed US regular-session close.
+2. Collect current market context with field-level source support and freshness checks.
+3. In Claude Code, invoke `run_pipeline.py` instead of issuing bulk FMP MCP calls. Keep provider payloads on disk and expose only compact summaries to the model.
+4. Audit the requested NYSE/Nasdaq/NYSE American listing universe through adaptive, exhausted market-cap bands when provider responses saturate.
+5. Build a reproducible economic candidate pool. Do not require complete financial statements across the whole market.
+6. Distinguish **enrichment attempted** from **enrichment resolved**.
+7. Apply the deterministic broad-screen script. Do not replace its statuses with ad hoc LLM cutoffs.
+8. Select up to three economically plausible deep-dive candidates in Claude Code through deterministic multi-lane sampling: core GARP, high-growth exceptions, quality near misses, and cyclicals requiring normalization. Apply a two-name sector cap when alternatives exist. Growth thresholds remain guidelines, not isolated hard gates.
+9. Resolve every row in the chosen candidate pool or record sourced exhaustion evidence.
+10. Perform corporate-action preflight and primary-source underwriting for every selected symbol.
+11. Save every selected symbol as a verified candidate record, including `review_required`, `screened_out`, and `excluded` outcomes.
+12. Assemble the schema-v3 / contract-v3.5 snapshot.
+13. Run `evaluate_candidates.py --strict --require-final`.
+14. Apply the final quality eligibility gate; route weak-cash-flow, low-ROIC, overleveraged, heavily dilutive, fragile-low-case, or severe-LOE names to `conditional` or `review_required`.
+15. Run `prepublish_audit.py`; repair every obtainable blocker and rerun.
+16. Run `bundle_run_artifacts.py` to produce a self-contained audit ZIP containing every referenced artifact.
+17. Present a formal ranking and downloadable bundle only when all gates pass.
+
+An exit code of `2` means **continue the same execution**: enrich the queue, verify the pool-generation audit, complete selected deep dives, or repair contract failures. It never means “ask the user to say continue.” After attaching the audit, run `manage_run_state.py next-action`; execute the returned action and every returned symbol. Never ask whether to process two versus five selected names. To change the budget, rerun the broad screen first so omitted names become `deferred_by_budget`.
+
+## Completion Semantics
+
+### Final ranking from an audited bounded pool
+
+A reproducibly generated bounded pool may support a **scoped final ranking** when:
+
+```text
+candidate-pool generation audit is valid
+candidate_pool_exhausted = true
+all_rows_resolved = true
+unresolved_count = 0
+queue_count = 0
+all selected symbols have verified candidate records
+strict final evaluation passes
+```
+
+Label the conclusion scope, such as `stratified_discovery_pool` or `provider_prefilter`. Do not imply that unexamined market listings were economically screened.
+
+### Market-wide “no qualifying candidates”
+
+A market-wide no-candidates conclusion requires all of the above plus full in-scope economic coverage:
+
+```text
+conclusion_scope = full_listing_universe
+candidate_pool covers every in-scope listing
+in_scope_missing_count = 0
+at least one row was economically assessable
+selected_symbols = []
+```
+
+### Bounded-pool “no qualifying candidates”
+
+A bounded pool may conclude only:
+
+```text
+no qualifying candidates in the audited bounded pool
+```
+
+It must not claim that the entire US small/mid-cap market has no qualifying company.
+
+Read `references/autonomous-execution.md` before a live minimal-request run.
+
+## When to Use
+
+Use this skill to:
+
+- Discover and rank US-listed undervalued-growth or GARP stocks.
+- Screen operating-company common stocks on NYSE, Nasdaq, and NYSE American.
+- Test whether EPS or FCF-per-share growth alone supports roughly 30%–50% upside over two to three years.
+- Refresh a prior screen after earnings, guidance, filings, corporate actions, or estimate revisions.
+- Compare candidates on forward valuation, growth durability, ROIC, standard FCF, SBC, dilution, peers, cycle risk, and sector-specific KPIs.
+
+Do not use it for:
+
+- A generic single-ticker report after a stock is already selected; use `us-stock-analysis`.
+- Pure dividend, momentum, technical-pattern, pre-revenue biotechnology, or merger-arbitrage screening.
+- Automatic order placement.
+
+## Prerequisites
+
+- Python 3.9 or later.
+- `requests` for the generated direct-FMP client; deterministic evaluation and audit scripts otherwise use the standard library.
+- `FMP_API_KEY` in the environment for Claude Code direct mode. Never commit or print the key.
+- Current SEC, company-IR, and macro sources accessible for selected-company underwriting.
+- Writable `reports/` and `.cache/` directories.
+- No specific paid FMP plan is assumed. Bulk endpoint failures fall back to bounded per-symbol enrichment and are disclosed in diagnostics.
+
+## Default Scope
+
+Unless the user specifies otherwise:
+
+- Exchanges: NYSE, Nasdaq, NYSE American.
+- Security type: active operating-company common stock.
+- Market-cap focus: USD 500 million–20 billion.
+- Minimum price: USD 5.
+- Preferred average daily dollar volume: USD 5 million; hard floor USD 1 million.
+- Claude Code provider-prefilter pool: target 30 symbols after code-side economics and verified liquidity; bounded per-symbol fallback may inspect up to 80 names without loading their provider payloads into model context.
+- Deep-dive budget: three symbols by default on the bounded Claude Code path, selected from four deterministic research lanes; three slots cannot represent all four lanes. Once selected, every symbol must be resolved; lower the budget only by rerunning the broad screen so omitted names become `deferred_by_budget`.
+- Maximum ranked output: ten, though the verified deep-dive set may be smaller.
+- Minimum formal constant-multiple upside: 30% over a supported two- or three-year horizon.
+- Multiple-contraction stress: current forward multiple reduced by 20%.
+- Minimum analysts for a rankable consensus horizon: three, unless a fully sourced independent forecast is constructed.
+
+### Immutable request scope and bounded execution
+
+For a minimal request, the user-requested market-cap scope is always USD 500M–20B. Never rewrite the run config so a convenient 3–4B band becomes the requested scope. Record `user_requested_scope` and `executed_scope` separately. A narrower executed scope is incomplete unless the user explicitly requested it; context or tool-budget pressure is not authorization. Stream listing pages/bands to JSONL rather than loading every row into the conversation context.
+
+### Liquidity evidence
+
+Never calculate ADDV from one session's volume. Candidate generation requires a provider average-dollar-volume measure or `price × average_volume` with an explicit averaging window of at least 20 trading days and source IDs. Rows lacking valid average-liquidity evidence remain `needs_enrichment` and cannot enter the discovery pool.
+
+### Current forward horizon
+
+A current P/E must be explicitly NTM or FY1 and must reconcile to a positive current forward EPS, price, fiscal-year/period metadata, estimate date, analyst count, and source IDs. Generic outer-year P/E values are invalid. A missing FY1/NTM row, a range crossing zero, or extreme forecast dispersion sends the name to enrichment or `unavailable_after_enrichment`; it must never appear as a low-P/E selection.
+
+## Result-Quality Controls
+
+### Deterministic multi-lane candidate discovery
+
+Do not let one global score fill the research budget with a single style or sector. Allocate the default five deep dives across these lanes when qualifying names exist:
+
+- two core GARP names,
+- one high-growth exception with Forward P/E up to 30x,
+- one quality near miss whose low valuation may compensate for sub-guideline headline growth,
+- one cyclical candidate that requires an explicit mid-cycle model.
+
+Backfill unused slots by deterministic priority and limit selections to two per sector when alternatives exist. Report each selected name's `selection_lane`. The LLM may explain these decisions but may not replace them with ad hoc cutoffs.
+
+### Formal eligibility quality gate
+
+A name that passes the upside test is not automatically `eligible`. Formal ranking also requires:
+
+- final score at least 70,
+- SBC-adjusted FCF yield at least 3% **or** EV/FCF at most 30x,
+- ROIC at least 8%,
+- Net Debt/EBITDA no more than 3.0x when applicable,
+- diluted-share CAGR no more than 5%,
+- at least 15% upside under a supported low-consensus case,
+- no severe LOE tail loss worse than the configured threshold.
+
+One or two ordinary failures may produce `conditional`; severe FCF or LOE failures and broader weakness produce `review_required`. Never label a low-P/E/high-EV-FCF transition story as a formal winner merely because average-consensus EPS implies 30% upside.
+
+### Independent forecast-driver evidence
+
+Every ranked year-2/year-3 bridge must use `construction_method=independent_driver_model`. Each revenue, margin, interest, tax, share-count, FCF, and adjustment driver needs an origin and source IDs. Mark any driver solved backwards from target EPS with `target_solved=true`; this fails the bridge. A residual adjustment that merely forces the model to consensus is not independent validation.
+
+### Publish only self-contained results
+
+The final report is not publishable until `prepublish_audit.py` verifies all referenced audit files, counts, hashes, scenario arithmetic, candidate statuses, final-three labels, and absence of unfinished-run language. Package the entire run directory with `bundle_run_artifacts.py`; a ZIP containing only Markdown/JSON summaries is incomplete.
+
+## Data Acquisition Strategy
+
+### Preferred Claude Code path — direct FMP, compact model context
+
+Run one local command:
+
+```bash
+python3 skills/us-undervalued-growth-screener/scripts/run_pipeline.py \
+  --config skills/us-undervalued-growth-screener/assets/claude-code-config.example.json \
+  --output-dir reports/us-undervalued-growth-screener
+```
+
+The generated FMP client reuses the repository's central `scripts/fmp_client/` source-of-truth pattern. It writes raw responses and a persistent SQLite cache to disk. Do **not** paste or read the raw provider trees into the language-model context. Read only `run-summary.json`, `NEXT_ACTION.json`, `audit/broad-screen-audit.json`, and the compact packets under `candidate-packets/`.
+
+For a market-wide run on a plan without bulk estimates, collect every frozen
+universe shard first, then screen the verified snapshot:
+
+```bash
+python3 skills/us-undervalued-growth-screener/scripts/run_pipeline.py \
+  --stage collect-estimates --shard-index 0 --shard-count 8 \
+  --snapshot-dir .cache/us-garp/snapshot-current \
+  --config skills/us-undervalued-growth-screener/assets/claude-code-config.example.json
+
+python3 skills/us-undervalued-growth-screener/scripts/run_pipeline.py \
+  --stage screen-full-snapshot \
+  --snapshot-dir .cache/us-garp/snapshot-current \
+  --config skills/us-undervalued-growth-screener/assets/claude-code-config.example.json \
+  --output-dir reports/us-undervalued-growth-screener
+```
+
+Run each shard once without `--resume`; use `--resume` only to continue an existing partial shard. If the provider call budget is exhausted during screen enrichment, `screen-full-snapshot` exits 2 and writes `audit/partial-run-diagnostic.json`; it has no `--resume`. Restore the provider budget and rerun the same verified snapshot in a new empty run directory. Read a partial artifact only when that diagnostic marker exists and its recorded hashes and row counts verify. A packet-stage budget failure also rewrites all broad-screen rows to `deferred_by_budget`; neither the audit nor any partial output is a final market-wide conclusion.
+
+Read `references/full-universe-snapshot.md` (section "Execution notes: shards, partial runs and budget exhaustion") before acting on any exit 2 or partial artifact from these commands. It also covers the shard collection order and the bulk-versus-per-symbol fallback.
+
+Before building or screening the candidate pool (Step 2), and before any manual pool route, read `references/data-acquisition-layers.md`. It holds the Layer 1 listing-universe audit, the Layer 2 candidate pool routes, the deterministic broad-screen rules and the Layer 3 primary-source deep dive. Its mandatory rules, in summary:
+
+- Do not substitute a share-volume floor for an ADDV threshold; calculate `price × average volume` locally and apply the dollar-liquidity rule.
+- Matching only the requested lower and upper market-cap endpoints is not proof of enumeration completeness; target at least 95% listing-field completeness.
+- Do not stop because a TTM or statement endpoint is plan-gated. Switch routes automatically.
+- Use the script-generated shortlist as authoritative. Do not remove GDDY-like near misses or KGS/AMKR-like cyclicals by applying an informal revenue-growth or cycle gate after the script runs.
+- Banks, insurers, REITs, BDCs, MLPs, and auto dealers remain blocked until sector-appropriate valuation or leverage evidence is available.
+- Describe a bounded per-symbol result as "N seeded names evaluated with consensus estimates", never as a market-wide conclusion.
+
+## Source and Evidence Rules
+
+Read the whole of `references/source-evidence-and-financial-controls.md` before underwriting any selected symbol. It holds the source hierarchy and source record requirements, then the Financial and Forecast Controls (standard FCF, cash classification, driver-derived forecast bridge, GAAP vs adjusted, ROIC and EBITDA) and the Sector and Cycle Controls (commercial biopharma, cyclicals and peak-profit risk).
+
+## Workflow
+
+### Step 1 — Run direct discovery in Claude Code
+
+For Claude Code, start with the direct runner above. It creates the run directory, listing and candidate-pool audits, compact candidate packets, `run-summary.json`, and `NEXT_ACTION.json`. Follow `NEXT_ACTION.json` without asking the user for confirmation. The manual commands below remain the fallback for hosts that cannot execute direct HTTP code.
+
+### Step 1B — Manual host fallback: create the run directory and live context
+
+```text
+reports/us-undervalued-growth-screener/<run-id>/
+├── market-context.json
+├── global-sources.json
+├── universe.jsonl
+├── discovery/
+├── broad-screen/
+├── run/
+└── final/
+```
+
+Never copy values, URLs, dates, source IDs, or tickers from synthetic example assets into a live run.
+
+### Step 2 — Build, normalize, and audit the candidate pool
+
+Keep the original user-requested scope in the run contract. If bulk economics are unavailable, build a bounded discovery pool from the fully audited listing universe without narrowing the requested market-cap range. Every listing row used for pool generation must carry validated provider-average or 20+ trading-day liquidity evidence.
+
+When provider screening is available, save one JSONL per lane and combine them deterministically:
+
+```bash
+python3 skills/us-undervalued-growth-screener/scripts/build_provider_prefilter_pool.py \
+  --universe reports/us-undervalued-growth-screener/<run-id>/universe.jsonl \
+  --lane core_garp=reports/us-undervalued-growth-screener/<run-id>/provider/core.jsonl \
+  --lane high_growth_exception=reports/us-undervalued-growth-screener/<run-id>/provider/high-growth.jsonl \
+  --lane quality_near_miss=reports/us-undervalued-growth-screener/<run-id>/provider/near-miss.jsonl \
+  --lane cyclical_normalization=reports/us-undervalued-growth-screener/<run-id>/provider/cyclical.jsonl \
+  --output-dir reports/us-undervalued-growth-screener/<run-id>/provider \
+  --analysis-as-of <ISO-8601> \
+  --source-id <provider-source-id> \
+  --per-lane 15 --max-pool 60 --minimum-pool 30
+```
+
+Use the emitted `provider-prefilter-audit.json` as `--discovery-audit` and `provider-prefilter-pool.jsonl` as the candidate pool.
+
+```bash
+python3 skills/us-undervalued-growth-screener/scripts/build_discovery_pool.py \
+  --input reports/us-undervalued-growth-screener/<run-id>/universe.jsonl \
+  --output-dir reports/us-undervalued-growth-screener/<run-id>/discovery \
+  --source-id <listing-source-id> \
+  --min-market-cap 500000000 \
+  --max-market-cap 20000000000 \
+  --user-requested-min-market-cap 500000000 \
+  --user-requested-max-market-cap 20000000000 \
+  --max-pool 120 \
+  --per-cell 3
+```
+
+Normalize dated annual consensus rows before Broad Screen. `--estimate-as-of` is mandatory. A company without a resolving NTM/FY1 row keeps its raw outer-year data only for diagnostics and becomes `unavailable` or remains in enrichment; it cannot receive a current Forward P/E.
+
+```bash
+python3 skills/us-undervalued-growth-screener/scripts/normalize_estimates.py \
+  --estimates reports/us-undervalued-growth-screener/<run-id>/discovery/raw-annual-estimates.jsonl \
+  --listing-input reports/us-undervalued-growth-screener/<run-id>/discovery/discovery-pool.jsonl \
+  --analysis-as-of <ISO-8601> \
+  --estimate-as-of <ISO-8601> \
+  --source-id <estimate-source-id> \
+  --output reports/us-undervalued-growth-screener/<run-id>/discovery/enriched-candidate-pool.jsonl
+```
+
+Merge the normalized estimate rows into the bounded pool, then run `screen_universe.py`. Supply explicit retrieval bounds and listing enumeration proof. Pass the generation audit with `--discovery-audit`.
+
+```bash
+python3 skills/us-undervalued-growth-screener/scripts/screen_universe.py \
+  --input reports/us-undervalued-growth-screener/<run-id>/universe.jsonl \
+  --candidate-pool reports/us-undervalued-growth-screener/<run-id>/discovery/enriched-candidate-pool.jsonl \
+  --discovery-audit reports/us-undervalued-growth-screener/<run-id>/discovery/discovery-audit.json \
+  --output-dir reports/us-undervalued-growth-screener/<run-id>/broad-screen \
+  --analysis-as-of <ISO-8601> \
+  --source-id <listing-source-id> \
+  --candidate-source-id <estimate-source-id> \
+  --candidate-generation-mode liquidity_stratified_estimates \
+  --retrieval-min-market-cap 500000000 \
+  --retrieval-max-market-cap 20000000000 \
+  --user-requested-min-market-cap 500000000 \
+  --user-requested-max-market-cap 20000000000 \
+  --provider-reported-total <count> \
+  --pages-fetched <count> \
+  --pagination-exhausted \
+  --config skills/us-undervalued-growth-screener/assets/screening-config.example.json \
+  --max-deep-dives 5
+```
+
+If the command exits `2`, inspect `enrichment-queue.json` and `broad-screen-audit.json`, continue enrichment in the same task, and rerun. Pass `--candidate-pool-exhausted` only after every row is resolved and the generation audit proves the bounded scope.
+
+### Step 3 — Checkpoint the run
+
+Initialize and attach the screening audit:
+
+```bash
+python3 skills/us-undervalued-growth-screener/scripts/manage_run_state.py init \
+  --run-dir reports/us-undervalued-growth-screener/<run-id>/run \
+  --analysis-as-of <ISO-8601> \
+  --price-as-of <ISO-8601> \
+  --session regular_close \
+  --price-source-id <source-id> \
+  --market-context reports/us-undervalued-growth-screener/<run-id>/market-context.json \
+  --global-sources reports/us-undervalued-growth-screener/<run-id>/global-sources.json \
+  --base-commit <git-sha>
+
+python3 skills/us-undervalued-growth-screener/scripts/manage_run_state.py set-screening-audit \
+  --run-dir reports/us-undervalued-growth-screener/<run-id>/run \
+  --audit reports/us-undervalued-growth-screener/<run-id>/broad-screen/broad-screen-audit.json \
+  --universe-artifact reports/us-undervalued-growth-screener/<run-id>/broad-screen/universe-audit-results.jsonl \
+  --candidate-artifact reports/us-undervalued-growth-screener/<run-id>/broad-screen/broad-screen-results.jsonl
+```
+
+### Step 4 — Complete selected deep dives
+
+For every selected symbol:
+
+1. Perform corporate-action preflight first.
+2. Verify the latest quarter and full year separately.
+3. Build standard FCF and TTM evidence.
+4. Normalize cash classification.
+5. Build same-basis current/year-2/year-3 valuation periods.
+6. Construct the independent forecast bridge.
+7. Reconcile adjusted metrics to GAAP.
+8. Source ROIC, EBITDA, SBC, dilution, peers, and sector/cycle evidence.
+9. Save the candidate as `verified`, even when the final candidate status will be `review_required`, `screened_out`, or `excluded`.
+
+```bash
+python3 skills/us-undervalued-growth-screener/scripts/manage_run_state.py save-candidate \
+  --run-dir reports/us-undervalued-growth-screener/<run-id>/run \
+  --candidate reports/us-undervalued-growth-screener/<run-id>/candidates/<SYMBOL>.json \
+  --stage verified
+```
+
+While `candidate_pool_status` is `sufficient_pending_enrichment`, `--stage verified` is refused. Deep dives may proceed, but save them with `--stage draft`. Finish enrichment, rerun the broad screen, and reattach the resolved audit with `set-screening-audit`, then save each candidate as `verified`. A verified candidate cannot be downgraded to draft, and `set-screening-audit` is rejected once any candidate is verified.
+
+### Step 5 — Complete and assemble
+
+```bash
+python3 skills/us-undervalued-growth-screener/scripts/manage_run_state.py set-status \
+  --run-dir reports/us-undervalued-growth-screener/<run-id>/run \
+  complete
+
+python3 skills/us-undervalued-growth-screener/scripts/manage_run_state.py assemble \
+  --run-dir reports/us-undervalued-growth-screener/<run-id>/run \
+  --output reports/us-undervalued-growth-screener/<run-id>/final/final-snapshot.json
+```
+
+### Step 6 — Strict evaluation and repair loop
+
+```bash
+python3 skills/us-undervalued-growth-screener/scripts/evaluate_candidates.py \
+  --input reports/us-undervalued-growth-screener/<run-id>/final/final-snapshot.json \
+  --artifact-root reports/us-undervalued-growth-screener/<run-id> \
+  --output-dir reports/us-undervalued-growth-screener/<run-id>/final \
+  --language ja \
+  --strict \
+  --require-final
+```
+
+Do not present a formal result unless the exit code is `0` and the output contains:
+
+```text
+contract.valid = true
+ranking_status = final
+unprocessed_candidates = []
+runtime.contract_revision = 3.5
+```
+
+### Step 7 — Prepublication audit and self-contained bundle
+
+Locate the generated final JSON and Markdown, then run:
+
+```bash
+python3 skills/us-undervalued-growth-screener/scripts/prepublish_audit.py \
+  --report-json reports/us-undervalued-growth-screener/<run-id>/final/<report>.json \
+  --report-md reports/us-undervalued-growth-screener/<run-id>/final/<report>.md \
+  --artifact-root reports/us-undervalued-growth-screener/<run-id> \
+  --output reports/us-undervalued-growth-screener/<run-id>/final/prepublish-audit.json
+
+python3 skills/us-undervalued-growth-screener/scripts/bundle_run_artifacts.py \
+  --run-dir reports/us-undervalued-growth-screener/<run-id> \
+  --report-json reports/us-undervalued-growth-screener/<run-id>/final/<report>.json \
+  --report-md reports/us-undervalued-growth-screener/<run-id>/final/<report>.md \
+  --output reports/us-undervalued-growth-screener/<run-id>/final/us-undervalued-growth-screen-<date>.zip
+```
+
+Both commands must exit `0`. Present the self-contained ZIP together with the report.
+
+## Output Format
+
+Generate both JSON and Markdown. The Markdown must include:
+
+- runtime/version and conclusion scope,
+- analysis and price timestamps,
+- market context and source ledger,
+- listing and candidate-pool audit/funnel,
+- broad-screen selected, deferred, review, unavailable, screened-out, and excluded rows,
+- formal ranking and score breakdown,
+- explicit 2Y/3Y constant-multiple and 2Y/3Y 20%-contraction scenarios,
+- candidate details, latest earnings, forecast bridge, GAAP reconciliation, peers, cycle/sector risks, catalysts, and invalidation conditions,
+- final three only when ranking is final,
+- unresolved data and global warnings.
+
+Never combine a 2Y base case with a 3Y stress case in one unlabeled column.
+
+## Resources
+
+- `references/claude-code-execution.md` — direct-FMP execution, cache, compact-context, and handoff contract.
+- `references/autonomous-execution.md` — same-turn execution, fallback, runtime, and completion contract.
+- `references/data-contract.md` — schema-v3 / contract-v3.5 source, audit, candidate, and output contract.
+- `references/methodology.md` and `methodology-ja.md` — financial and investment methodology.
+- `references/research-checklist.md` — primary-source underwriting checklist.
+- `references/scoring-rubric.md` — score, penalties, quality caps, and status gates.
+- `references/sector-kpis.md` — sector valuation/KPI requirements.
+- `references/output-template.md` — required JSON/Markdown presentation.
+- `references/checkpointing.md` — atomic save/resume procedure.
+- `references/review-regression-matrix.md` — observed failures and preventing tests.
+- `references/migration-v3.5-to-v3.6.md` — Claude Code direct-FMP migration and operating changes.
+- `references/migration-v3.4-to-v3.5.md` — prior breaking changes and upgrade steps.
+- `scripts/skill_version.py` — canonical runtime/version constants.
+- `scripts/fmp_client.py` — generated stable-first FMP client with SQLite cache and raw-artifact storage.
+- `scripts/run_pipeline.py` — Claude Code-native direct-FMP discovery runner with compact stdout.
+- `scripts/build_provider_prefilter_pool.py` — audited four-lane provider pool builder.
+- `scripts/build_discovery_pool.py` — deterministic fallback pool generation with average-liquidity validation.
+- `scripts/normalize_estimates.py` — identify and validate current NTM/FY1 consensus horizons.
+- `scripts/screening_semantics.py` — shared fail-closed liquidity and forward-horizon semantics.
+- `scripts/screen_universe.py` — listing audit and broad-screen engine.
+- `scripts/manage_run_state.py` — checkpoint and final snapshot manager.
+- `scripts/evaluate_candidates.py` — deterministic strict evaluator, quality eligibility gate, and report renderer.
+- `scripts/prepublish_audit.py` — final artifact/count/scenario/prose audit.
+- `scripts/bundle_run_artifacts.py` — deterministic self-contained audit bundle builder.

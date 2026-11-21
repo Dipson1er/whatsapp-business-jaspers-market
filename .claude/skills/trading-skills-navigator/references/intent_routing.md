@@ -1,0 +1,290 @@
+# Intent Routing Rubric
+
+`scripts/recommend.py` is the **single source of truth** for routing. This
+document explains the engine; `assets/intent_benchmark_v1.json` is the
+explicitly labeled 246-case EN/JA gold corpus, and
+`scripts/intent_benchmark.py` is its fail-closed evaluator.
+
+## Engine overview
+
+1. Normalize the query (lowercase, collapse whitespace). **Bilingual** — every
+   persona carries both English and Japanese trigger terms, so the recommender
+   routes a JA goal (e.g. 「配当株を探したい」「APIキー無しで使えるもの」「スイング
+   トレードをしたい」) the same as its English equivalent. (`.lower()` leaves
+   Japanese unchanged; mixed-case "API" folds to "api", which the JA no-API
+   terms account for.)
+2. Walk the **ordered persona table**. The **first** matching persona wins.
+3. A persona either names a `primary` workflow (+ optional `secondary`), or an
+   `gap_category` (honest gap — no workflow shipped).
+4. Apply constraint filters (`--no-api`, `--time-budget`, `--experience`).
+5. Emit a stable JSON recommendation, including `no_api_path` and
+   `routing_diagnostics` (see below).
+
+If **no** persona matches, the input is treated as unmapped → a graceful
+**beginner default** (`market-regime-daily`, `honest_gap: false`) with a
+`note` asking the user to rephrase. This is distinct from an *honest gap*
+(persona #1), which is a recognized intent with no shipped workflow.
+`routing_diagnostics.status` is `fallback` in this path, so the default is not
+presented as a confident exact match.
+
+## Persona table (order matters)
+
+Evaluated top-to-bottom; first match wins, except that `no-api-path` becomes a
+constraint when another substantive goal also matches. Candidate order stays
+unchanged, while the selected persona identifies the substantive goal. Order
+otherwise encodes precedence:
+
+| # | Persona | Trigger gist | Result |
+|---|---|---|---|
+| 1 | `short-strategy-trader` | "short strategies / shorting / parabolic short" | honest gap → `advanced-satellite` |
+| 2 | `strategy-researcher` | "backtest / research a strategy / strategy ideas" | `strategy-research-pipeline` |
+| 3 | `shapiro-contrarian-futures-trader` | "COT / Shapiro / crowded futures" | `shapiro-contrarian` |
+| 4 | `no-api-path` | "without API / no subscription / free only" | `market-regime-daily` + {`trade-memory-loop`, `monthly-performance-review`}, force `no_api` |
+| 5 | `stockbee-20pct-researcher` | "20% movers / explosive mover model book" | `stockbee-20pct-study-daily` |
+| 6 | `stockbee-episodic-pivot-trader` | "episodic pivot / Day 1 EP / delayed EP" | `stockbee-ep-daily` |
+| 7 | `stockbee-fluency-learner` | "setup fluency / setup model book" | `stockbee-fluency-loop` |
+| 8 | `multi-asset-opportunity-trader` | "multi-asset / cross-asset opportunities" | `multi-asset-opportunity-daily` |
+| 9 | `part-time-swing-trader-regime-gated` | "swing" **AND** regime-conditional ("only when", "favorable", "when the market") | `market-regime-daily` + `swing-opportunity-daily` |
+| 10 | `morning-risk-check` | "15 min each morning / can I take risk today" | `market-regime-daily` |
+| 11 | `separate-core-satellite` | "separate / split long-term from short-term risk" (not "dividend") | `market-regime-daily` + `core-portfolio-weekly` |
+| 12 | `kanchi-dividend-investor` | "Kanchi / high-dividend screening" | `kanchi-dividend-weekly` |
+| 13 | `dividend-long-term-investor` | "dividend / holdings / rebalance / long-term investor" | `core-portfolio-weekly` |
+| 14 | `earnings-momentum-trader` | "earnings momentum / post-earnings drift / PEAD / 決算モメンタム" | `earnings-weekly` |
+| 15 | `swing-trader` | "swing / breakout" (no regime gate) | `swing-opportunity-daily` |
+| 16 | `beginner-onramp` | "beginner / where do I start / getting started" | `market-regime-daily` |
+| 17 | `monthly-reviewer` | "monthly review / end of month / performance review" | `monthly-performance-review` |
+| 18 | `trade-journaler` | "journal / postmortem / closed trade / lessons learned" | `trade-memory-loop` |
+
+**Critical orderings**
+
+- #1/#2 before everything so "short strategies" / "backtest" are not
+  swallowed by accidental keyword overlap. Only #1 remains an honest gap.
+- #1 triggers only on short-**selling** phrases ("short strateg", "shorting",
+  "go short", "short position"…) — it deliberately does **not** match
+  "short-term", so #6 ("separate long-term holdings from short-term risk")
+  still routes to the regime layer.
+- #9 (swing **and** regime-conditional) before #14 (generic swing): Q1
+  ("swing trade only when the market is favorable") → regime first; Q5
+  ("do swing trading") → swing directly.
+- #11 before #13 and excludes "dividend": "separate long-term holdings from
+  short-term risk" → regime/core split, not the dividend bucket.
+- #12 before #13: specific Kanchi candidate sourcing wins over broad dividend
+  portfolio maintenance while both candidates remain visible in diagnostics.
+- #14 before #15: the JA term 「決算モメンタム」 contains the generic swing term
+  「モメンタム」, so the earnings routine must win; the registered shadowing
+  contract covers it. Day 1 episodic-pivot phrasing stays with #6.
+- #17 before #18: specific JA monthly phrases such as 「今月の振り返り」 win
+  over the generic journal term 「振り返り」.
+
+## Routing diagnostics and benchmark gate
+
+`routing_diagnostics.candidate_personas` contains every persona whose
+`matches()` predicate succeeds, in `PERSONAS` order and before no-API/time
+constraints are applied. The first candidate remains the selected persona for
+backward compatibility. One match is `exact`; multiple matches are
+`ambiguous`; no matches are `fallback` with `selected_persona: null`.
+
+The versioned corpus requires all 18 personas and all 14 workflows to carry
+positive and hard-negative coverage in both English and Japanese. Its
+metamorphic cases cover EN case/punctuation/word-order/orthographic changes and
+JA punctuation/word-order/orthographic/particle/conjugation changes. Candidate
+precision, candidate recall, selected accuracy, and workflow accuracy are all
+fixed at 1.0. Static shadowing contracts fingerprint every ordered
+cross-persona term containment; a new overlap, stale allowlist entry,
+contradictory require/exclude group, or unlabeled ambiguous contract fails CI.
+
+Run the same gate locally:
+
+```bash
+python3 skills/trading-skills-navigator/scripts/intent_benchmark.py \
+  --project-root .
+```
+
+## The 10-Question Contract
+
+`PROJECT_VISION.md` §12 lists 9 example questions and a DoD of "10". Q1–Q9 are
+verbatim; **Q10 is authored** to complete the executable contract. Each row is
+a golden test in `tests/test_recommend.py` (the hard Phase-1 gate).
+
+| # | Question | Primary | Secondary | Skillset | no-API | honest-gap |
+|---|---|---|---|---|---|---|
+| 1 | invest long term but swing trade only when market favorable | `market-regime-daily` | `swing-opportunity-daily` | market-regime | no | no |
+| 2 | 15 min each morning, can I take risk today | `market-regime-daily` | — | market-regime | yes | no |
+| 3 | separate long-term holdings from short-term risk | `market-regime-daily` | `core-portfolio-weekly` | market-regime | no | no |
+| 4 | review holdings and dividend candidates this week | `core-portfolio-weekly` | — | core-portfolio | no | no |
+| 5 | do swing trading | `swing-opportunity-daily` | — | swing-opportunity | no | no |
+| 6 | find dividend stocks | `core-portfolio-weekly` | — | core-portfolio | no | no |
+| 7 | use short strategies | **null** | — | advanced-satellite | — | **yes** |
+| 8 | what works without API keys | `market-regime-daily` | `trade-memory-loop`, `monthly-performance-review` | market-regime | yes | no |
+| 9 | beginner-friendly starting path | `market-regime-daily` | — | market-regime | yes | no |
+| 10 | research and backtest new strategy ideas *(authored)* | `strategy-research-pipeline` | — | strategy-research | yes | no |
+
+Q8 honors the single-`primary_workflow` schema: primary is
+`market-regime-daily`; the rest of the no-API set are `secondary_workflows`;
+`skillset` is the primary's category (`market-regime`).
+
+For backtest execution terms (`backtest`, `back-test`, `back test`,
+`バックテスト`), Q10 still recommends the offline research workflow but includes
+a capability note in JSON and text: the workflow evaluates metrics from a
+separate backtest and cannot perform that backtest itself. `no_api_path: true`
+describes only this workflow, not the external tool or its historical data.
+
+## Skillset rule
+
+`skillset.id` = the skills-index **category of the workflow's first required
+skill** (manifest order). Not "most common category": e.g.
+`swing-opportunity-daily`'s required skills span swing-opportunity /
+trade-planning / trade-memory; only the first (`vcp-screener` →
+`swing-opportunity`) yields the contract-correct skillset. `source` is always
+`skills-index.category`.
+
+`manifest_status` (PR-N2): `active` iff a `skillsets/<skillset.id>.yaml`
+manifest ships (the manifest `id` == the skills-index category, so the lookup
+is a direct match — carried as the `skillsets` list in the SSoT / bundled
+snapshot). Today the shipped set is `market-regime`, `core-portfolio`,
+`dividend-income`, `swing-opportunity`, `trade-memory`, `strategy-research` →
+those report `active` for a workflow the manifest names in `related_workflows`
+(`dividend-income` backs `kanchi-dividend-weekly`, persona #12).
+Categories with no manifest — including the honest-gap category
+`advanced-satellite` for #7, which is also the category of `earnings-weekly`'s
+first required skill (`earnings-trade-analyzer`) — report `deferred`. The skillset object shape is
+unchanged (`{id, source, manifest_status}`); only the status value reflects
+manifest presence.
+
+`skillset.manifest` (PR-N3): always present in the `skillset` object — a 5-key
+view `{display_name, required_skills, recommended_skills, optional_skills,
+related_workflows}` when `manifest_status == active`, else `null`. It describes
+the **primary (dominant-category) skillset only** — it is *not* the install
+list.
+
+`setup_bundle` (PR-N3, top-level): the actionable install union over the
+primary skillset/workflow **plus every secondary workflow**'s
+required/optional, deterministically ordered (primary first, then secondaries
+in `secondary_workflows` order) and tier-deduped (required > recommended >
+optional). `sources` records each contributor (`skillset:<id>` /
+`workflow:<id>`). This exists because a single skillset cannot cover a
+multi-workflow recommendation — e.g. Q1's `market-regime` skillset alone would
+drop `swing-opportunity-daily`'s `vcp-screener`. Honest gap → all-empty
+(`suggested_skills` is the install list there). `setup_bundle` is what
+`setup_paths.md` / `SKILL.md` Step 4 instruct the user to install.
+
+## The `--no-api` credential rule
+
+A workflow needs a paid key if **either**:
+
+- `api_profile ∈ {fmp-required, finviz-required, alpaca-required}`, **or**
+- any entry in its `required_skills` has an integration with
+  `id ∈ {fmp, finviz, alpaca}` **and** `requirement == required`.
+
+`api_profile: mixed` is **never** trusted on its own — the required-skill
+credentials are always inspected. Consequences:
+
+- `core-portfolio-weekly` is `alpaca-required` → excluded under `--no-api`,
+  even though `portfolio-manager` lists Alpaca as `optional` for its offline
+  mode.
+- `swing-opportunity-daily` is `fmp-required` → excluded.
+- `market-regime-daily` is `no-api-basic`; its required skills use
+  `public_csv` at `required` — **not a paid key** → kept.
+- `trade-memory-loop` / `monthly-performance-review` are `no-api-basic`;
+  `trader-memory-core` has FMP at `optional` (not required) → kept.
+
+When `--no-api` blocks the matched workflow, the engine keeps that workflow
+in `goal_match` with `runnability: blocked` and the paid integration in
+`missing_requirements`. The requested goal has `primary_workflow: null`,
+`honest_gap: true`, `no_api_path: null`, and an empty `setup_bundle`.
+`market-regime-daily` may appear separately as a `different_goal`
+`alternative_workflow`; it never becomes an exact portfolio/swing match. When
+the blocked goal is `core-portfolio-weekly` and the query names holdings, a
+portfolio or positions, `portfolio-holdings-review` appears instead as a
+`limited_alternative`. The goal stays blocked, because that workflow is not a
+full brokerage review.
+
+For core-portfolio-weekly, any CSV mention ("from a CSV file", "I have a csv",
+"portfolio review csv", "CSVファイルで管理している…") is read as the portfolio
+*source* and selects `portfolio-holdings-review`. So does a saved positions file
+("from a saved Alpaca positions json", "positions.json", "AlpacaのJSONから").
+Navigator accepts no file path argument and does not read files. The exception
+is a CSV that is clearly an output ("export/save/send … csv", "CSVに出力") with
+no input pattern present; input patterns win. Common negated wording ("not from a
+CSV", "don't use a CSV", "CSVは使わず") is ignored, and naming or negating Alpaca
+never changes the outcome by itself. Live-data wording ("live positions as json",
+"from the JSON feed") does not select the offline path. Matching is keyword based,
+so unusual wording can still be misread; a misread negation falls through to the
+full route.
+Explicit saved input wins over JSON output, in either order: "Review my portfolio
+from a saved Alpaca positions JSON and export the review to JSON" and
+"保有銘柄を保存済みのポジションJSONから確認してJSONに出力" retain the offline route,
+with or without `--no-api`. A saved file can mention API provenance or "without
+API" without becoming live input. Generic "from JSON" retains the live/API/feed
+guard. A filename appearing only as an output destination ("export to
+holdings.json"), saved output ("export saved positions to JSON"), or a negated
+saved input (including "saved Alpaca positions JSON is not available") does not
+select the offline route. These are bounded keyword heuristics, not a parser for
+arbitrary conflicting source instructions.
+
+Known limitation: a CSV or saved-file query with no portfolio wording, or a
+Japanese phrasing the persona does not recognize (for example "I have a CSV" or
+"保有ポートフォリオを保存したJSONから確認"), does not match the portfolio persona and falls back to
+market-regime-daily; goal matching is unchanged here.
+
+Under `--no-api`, paid-API *secondary* workflows are removed from
+`secondary_workflows` and listed in `dropped_secondary_workflows`
+(`[{id, reason}]`, `[]` when none). The field is deliberately separate from
+`goal_match.missing_requirements`: dropping a follow-on step does not block the
+matched goal. Text output prints one `Dropped secondary (no-API): <id>` line
+per entry.
+
+## `no_api` vs `no_api_path` (the DoD's API-vs-no-API separation)
+
+Two distinct booleans — narrate `no_api_path`, not `no_api`:
+
+- **`no_api`** — *request-side*: was no-API constraint mode active (the
+  `--no-api` flag, or the `no-api-path` persona forcing it). It says nothing
+  about whether the result actually needs keys.
+- **`no_api_path`** — *path-side*: does the **entire** recommendation (primary
+  **and every** secondary) work without paid API keys?
+  `workflow_paid_api_reason(primary) is None and all(... for secondary)`.
+  `null` when no usable goal path exists (unshipped or blocked). This is the 10-Question Contract's
+  "no-API" column.
+
+This is why Q1 and Q2 both recommend `market-regime-daily` yet differ: Q2 has
+no secondary → `no_api_path: true`; Q1 also pulls in `fmp-required`
+`swing-opportunity-daily` → `no_api_path: false`. A bare
+`market-regime-daily`/`trade-memory-loop`/`monthly-performance-review` path is
+`true` even without `--no-api`, which is exactly the DoD's "separate API-key
+and no-API paths".
+
+## Tie-breaks
+
+- **`--time-budget`** (`15m/30m/60m/90m/any`): secondary workflows whose
+  `estimated_minutes` exceed the budget are dropped (primary is never dropped —
+  it stays as the best intent match, with a `rationale` note if it is over
+  budget).
+- **`--experience`**: `beginner` sorts beginner-difficulty secondaries first.
+- Secondary order is otherwise deterministic: `(beginner_first,
+  estimated_minutes, id)`.
+
+## Honest gap output
+
+For persona #1 (`advanced-satellite`):
+`primary_workflow: null`, `secondary_workflows: []`, `skillset.id` = the gap
+category, `suggested_skills` = that category's non-deprecated skills
+(id-sorted, `{id, display_name, category}`), `honest_gap: true`, and a `note`
+stating the workflow manifest is deferred. Exit code is still `0` — an honest
+gap is a successful, honest recommendation.
+
+## Goal availability (Issue #511)
+
+`goal_match` retains the original persona and best matching workflow before
+constraints are applied. Its `runnability` is `eligible` (metadata and stated
+constraints allow the path, not proof that data is ready), `blocked` (a matching
+workflow exists but the request cannot use it), `unshipped` (no dedicated
+workflow), or `unmatched` (unmapped input and a beginner fallback). A blocked
+result has `routing_diagnostics.status: unavailable`, typed
+`missing_requirements`, and no primary/setup bundle. An
+`alternative_workflow` is shown independently.
+
+When a query combines a substantive goal with a phrase such as "without API",
+the no-API persona supplies a constraint and the substantive persona remains
+the goal. A standalone request for a no-API path still selects that persona's
+general on-ramp.

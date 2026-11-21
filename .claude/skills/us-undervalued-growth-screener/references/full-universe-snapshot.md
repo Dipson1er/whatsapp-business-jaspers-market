@@ -1,0 +1,264 @@
+# Full-universe estimate snapshot (v3.7 — sharded collection)
+
+The v3.6.1 pilot economically evaluates ~4% of the listed universe and is
+therefore permanently `ranking_scope: final_scoped`. The v3.7 path earns
+`final_marketwide` the only honest way: by attempting estimate acquisition for
+EVERY listed symbol at least once. On plans where bulk endpoints are 402, that
+means collecting per-symbol across deterministic shards within each run's API
+budget, persisted into a frozen snapshot.
+
+## Stage: `collect-estimates`
+
+```bash
+python3 scripts/run_pipeline.py \
+  --stage collect-estimates \
+  --shard-index 0 --shard-count 8 \
+  --snapshot-dir .cache/us-garp/snapshot-2026-08 \
+  --config assets/claude-code-config.example.json \
+  [--resume]
+```
+
+- The FIRST invocation enumerates listings and **freezes the universe** into
+  the snapshot directory (`snapshot-manifest.json` + `universe.jsonl` +
+  `listing-enumeration-audit.json`,
+  identified by `snapshot_id` = timestamp + universe SHA-256). Every later
+  shard run writes into that frozen snapshot; new listings and delistings go
+  to the NEXT snapshot, never mixed in.
+- Collection is current-only: a historical or future `--analysis-as-of` is
+  rejected before client/cache/raw/snapshot creation. Each row records
+  `snapshot_normalization_as_of`; shard manifests aggregate its bounds so a
+  later screen cannot treat an old FY-period normalization as current.
+- Shard membership is `sha256(symbol) % shard_count` — the same symbol always
+  lands in the same shard, so multi-day collection is deterministic.
+- Each attempted symbol is normalized (FY1-FY3 EPS/revenue, analyst counts)
+  and classified into exactly one bucket:
+  `evaluable / no_estimates / negative_eps / unit_mismatch / excluded`
+  (precedence: excluded > unit_mismatch > no_estimates > negative_eps >
+  evaluable; the unit gate is the round-8 fail-closed
+  `requires_unit_reconciliation`).
+- **Provider failures are never classified.** The client returns an empty
+  list for HTTP failures, offline cache misses and invalid JSON as well as
+  for genuinely empty consensus; the stage distinguishes them via the
+  client's per-call diagnostics (calls / cache hits / failure count) and
+  records failures as `fetch_failed` — the symbol stays uncollected, the
+  shard stays `partial` (`shard_partial_fetch_failures`, exit 3), and the
+  marketwide invariant cannot be satisfied by outages. HTTP-200 error
+  bodies (`{"Error Message": ...}` plan-limit style) are validated in the
+  client itself: recorded as `provider_error_payload`, never cached; a
+  malformed object that predates validation in an existing cache is
+  flagged `unexpected_payload_shape` on read and likewise becomes a fetch
+  failure.
+- Budget exhaustion mid-shard exits with code **3**, records the shard as
+  `partial` in the manifest, and is resumable with `--resume`. A shard file
+  that already exists without `--resume` is refused.
+- **The frozen universe is re-verified on every load** (manifest schema,
+  row count, symbol uniqueness, canonical SHA-256) before any API access or
+  shard append; a swapped `universe.jsonl` is refused.
+- Every collected row carries `snapshot_retrieved_at` — the ACTUAL fetch
+  time. Cache-served rows (any cache hit, including a failed stable HTTP
+  attempt falling back to the v3 cache) are stamped from the cache entry's
+  creation time; when that provenance cannot be resolved the stamp stays
+  **null** (counted as `retrieval_time_unknown`, never back-filled with
+  "now"). Shards aggregate `oldest_retrieved_at` / `newest_retrieved_at`,
+  and a run that collects nothing does NOT refresh the shard's `as_of`
+  freshness stamp.
+- Shard summaries (`shard-<i>-summary.json`) and the manifest carry attempted
+  / expected / fetch-failed counts, per-bucket classification, `as_of`,
+  retrieval and normalization bounds, and calls used.
+
+## Stage: `screen-full-snapshot`
+
+After every shard is complete, run the current-only market-wide screen:
+
+```bash
+python3 scripts/run_pipeline.py \
+  --stage screen-full-snapshot \
+  --snapshot-dir .cache/us-garp/snapshot-2026-08 \
+  --config assets/claude-code-config.example.json \
+  --output-dir reports/us-undervalued-growth-screener
+```
+
+This stage performs its read-only snapshot preflight before constructing the
+FMP client or creating cache, provider-raw, or run directories. It refuses an
+incomplete, stale, future-dated, tampered, or semantically misclassified
+snapshot with exit code 1 and creates no run artifact tree.
+
+The screen is deliberately current-only. Exact-liquidity and TTM quality
+probes use current provider evidence, so an operator-supplied historical
+`--analysis-as-of` is rejected before those calls rather than mixing current
+fundamentals into a historical ranking. The allowed wall-clock skew defaults
+to five minutes.
+
+For a ready snapshot, the stage:
+
+1. uses the verified in-memory shard rows from the same reads that produced
+   the readiness verdict;
+2. rechecks gap-free exhausted bands for every requested exchange, requires
+   the frozen market-cap/price scope to contain the screen request, then binds
+   that audit, the manifest, frozen-universe SHA-256, and every shard SHA-256
+   into a `snapshot_verification_digest` carried by all downstream audits;
+3. records the estimate-attempt classification and retrieval provenance for
+   every frozen symbol in `universe-audit-results.jsonl`;
+4. builds a deterministic 30–50 name multi-lane pool (default 50), backfills
+   failed/empty exact-liquidity calls until the target succeeds or every
+   eligible symbol has an explicit outcome, probes every preliminary-pool
+   name for current quality evidence, and never selects an unprobed deep-dive
+   name; and
+5. commits five deep-dive slots for the market-wide path.
+
+A verified snapshot with no economically evaluable names can produce a formal
+market-wide no-candidate result. Missing coverage, an unresolved enrichment
+queue, or a short pool that cannot prove exhaustion remains diagnostic and
+exits 2. A successful underwriting handoff or verified no-candidate result
+exits 0.
+
+### Budget exhaustion and partial screen diagnostics
+
+Liquidity, quality-probe, and candidate-packet enrichment are fail-closed. If
+the provider budget is exhausted, `screen-full-snapshot` exits 2 and persists
+`audit/enriched-estimates.partial.jsonl` and
+`audit/partial-run-diagnostic.json`. The diagnostic is written last as the
+commit marker and records the snapshot ID/digest, stage, target-order
+progress, interrupted symbol and provider operation, provider counters, and
+SHA-256/row-count records for the partial summary and rows. Consumers must
+verify the marker and every recorded hash before reading partial artifacts;
+without a valid marker, the preceding files are not authoritative.
+
+The current symbol is `attempted` and `interrupted`, and remains `pending`; a
+symbol is `completed` only after all provider calls required by its current
+stage finish. Quality-probe interruption preserves a current row even when its
+key-metrics call succeeded but its actual-EPS call did not. A packet interrupted
+inside an endpoint is not written as a packet; completed packets and provider
+raw/cache evidence remain available. The already-written broad-screen audit is
+rewritten as `status: incomplete`, `conclusion_scope: diagnostic`, and
+`ranking_scope: diagnostic`, with top-level, deep-dive, candidate-pool, and
+generation-audit selection commitment fields cleared. Broad-screen rows are
+rewritten from `selected` to `deferred_by_budget`, and the audit's row hash is
+updated before the diagnostic marker is written.
+
+Each screen attempt uses a new empty run directory. The CLI adds a unique
+attempt suffix to the run ID and stores provider raw responses in a sibling,
+attempt-specific `.provider-raw/<run-id>/` directory; direct callers are
+rejected if they pass a non-empty output directory. An explicitly supplied raw
+store must also remain outside the run directory. This prevents a retry from
+mixing partial output with stale final artifacts from an earlier attempt.
+
+There is no `--resume` for screening. After the budget is restored, rerun the
+same verified snapshot; successful new calls may append cache/raw records and
+the rerun may reuse existing records, but the snapshot itself remains
+read-only. Partial output never authorizes a market-wide conclusion or a real
+trade.
+
+## Readiness and content binding
+
+Two layers, deliberately separate:
+
+- **`snapshot_status(manifest)` → `collection_ready`** — manifest-level
+  aggregation only (all shards complete with zero `fetch_failed`,
+  classification counts summing exactly to the frozen universe,
+  `retrieval_time_unknown == 0`, `normalization_time_unknown == 0`). It trusts
+  the manifest's own counters and
+  therefore proves nothing about the shard files.
+- **`load_verified_snapshot(snapshot_dir, screening_as_of=..., max_staleness_days=...)`
+  → `verdict + verified rows`** — the ONLY source of the screening verdict and
+  consumable rows. It
+  reads the hash-bound listing-enumeration audit and every `shard-*.jsonl`
+  exactly once and verifies against the frozen universe:
+  file presence and SHA-256 vs the manifest, no duplicate symbols, every
+  symbol in the frozen universe and in its `stable_shard` shard, the union
+  covering the universe EXACTLY, classifications limited to allowed values,
+  per-shard counts matching the manifest — plus staleness measured from the
+  ACTUAL aggregated `oldest_retrieved_at` and
+  `oldest_normalization_as_of` against
+  `screening_as_of - max_staleness_days` (never the operator-supplied
+  collection `as_of`).
+
+Only a run screened from this same-read bundle with
+`ready_for_screening: true`, an exact classification total, and a bound
+`snapshot_verification_digest` may emit `ranking_scope: final_marketwide`.
+
+## Operating on the FMP Starter plan
+
+~2,371 symbols ≈ 1 estimate call each. The paid FMP plans state their call
+limits per minute, not per day (see the dated note,
+`docs/en/getting-started.md#fmp-plans`). The client starts calls at least
+`FMPClient.RATE_LIMIT_DELAY` (0.30 s) apart, so it sends at most 200 a minute,
+which is under the Starter limit in that note; a 429 is retried once after 60 s.
+The limit that sizes the shards is the per-run call budget.
+
+- **Per-run budget.** A `collect-estimates` run stops at `max_api_calls`
+  (default 350, `--max-api-calls`). A symbol costs one call, or two when the
+  stable endpoint fails and the v3 fallback is tried. Every attempt counts
+  against `max_api_calls`, including the one retry after a 429, so a
+  rate-limited symbol can cost up to four calls (stable and v3, each retried
+  once). The run that freezes the
+  universe also pays for the listing enumeration: one company-screener query
+  per exchange, two more each time a market-cap band saturates, and the same
+  v3 fallback per query.
+- **Shard count.** Choose it so the largest shard fits the budget with room
+  for the enumeration, some fallbacks and retries. Shards are `sha256(symbol) %
+  shard_count`, so they are uneven: 8 shards average ~296 symbols, but in
+  1,000 simulated 2,371-symbol universes the largest of the 8 held 321
+  symbols at the median, 345 at the 99th percentile and 356 at most. 7 shards
+  would put the median largest shard at 363, over the budget; 9 kept every
+  simulated shard at 326 or fewer, for one more run. With 8, the largest
+  shard can occasionally run out of budget; it exits 3 and continues with
+  `--resume`.
+- **Schedule.** Run the 8 shards back to back in one session. Pacing alone
+  is ~90 s per shard (~12 minutes for the universe), plus request latency.
+  A one-session build also keeps the snapshot fresh. Screening measures
+  staleness from the aggregated `oldest_retrieved_at` against
+  `full_snapshot_max_staleness_days` (default 7), so a build spread over four
+  days has used three of those days by the time the last shard lands.
+
+The free Basic plan cannot build a snapshot, because the listing enumeration
+needs the company screener, which that note lists as plan-gated. After the
+initial build, only incremental refresh is needed (new snapshot per refresh
+cycle; post-earnings and revised names first).
+
+## Shared coverage semantics
+
+`scripts/coverage_semantics.py` is the single source of truth for
+`classify_ranking_scope` / `build_coverage_block` /
+`derive_ranking_scope_from_audit` / `validate_coverage_block`; both
+`run_pipeline` (discovery) and `evaluate_candidates` (final evaluation) import
+it, so the tri-state semantics cannot drift between the two sides.
+
+## Execution notes: shards, partial runs and budget exhaustion
+
+Run each shard once without `--resume`; use `--resume` only to continue an
+existing partial shard. Both collection and screening are current-only:
+collection fixes the estimate-normalization basis, while screening adds exact
+liquidity and TTM quality evidence. The first collection binds the exhausted
+listing-enumeration audit into the snapshot manifest. Screening performs a
+read-only content/freshness preflight before creating provider or run
+artifacts, carries a digest binding the enumeration proof and every verified
+shard into downstream audits, backfills liquidity failures until 50 valid
+names or full eligible exhaustion, and commits five probed deep-dive names. The full collection and screening
+contract is described in the sections above.
+
+If the provider call budget is exhausted during screen enrichment, the command
+exits 2 and writes `audit/partial-run-diagnostic.json` plus
+`audit/enriched-estimates.partial.jsonl`. The diagnostic is the last atomic
+commit marker and records the snapshot ID/digest, stage, deterministic
+attempted/completed/pending/interrupted symbols, interrupted provider
+operation, provider counters, and hashes for the partial artifacts. Read a
+partial artifact only when that marker exists and its recorded hashes and row
+counts verify; a missing or mismatched marker makes the partial output
+non-authoritative. `screen-full-snapshot` has no `--resume`: rerun the same
+verified snapshot after restoring the provider budget, allowing new cache/raw
+records from successful calls and reusing existing cache/raw data without
+deleting or rewriting it. A packet-stage budget failure also marks
+`broad-screen-audit.json` incomplete/diagnostic, clears all nested selection
+commitment fields, and rewrites **all** broad-screen rows (including rejected
+rows) to `deferred_by_budget` with selection eligibility disabled. The original
+`decision` is preserved in `prior_decision`, and original top-level selection
+fields in `prior_selection`; these archives are audit-only, never selection
+authority, and repeated invalidation retains the first archive. Neither the
+audit nor any partial output is a final market-wide conclusion. Quality-probe
+`calls_used` and `actual_eps_calls` count FMP provider-budget units: cached or
+unsent calls cost zero, and consumed retry responses remain counted. Each retry uses a new empty run directory. The CLI adds a unique
+attempt suffix and keeps raw responses in a sibling attempt directory, while
+direct callers must not reuse a non-empty output directory.
+
+The direct runner first attempts bulk ratios, key metrics, estimate, and EOD datasets. It falls back to bounded per-symbol enrichment only when bulk access is unavailable; a plan-gated (402/403) bulk endpoint is remembered in the cache for 30 days so later runs do not spend calls re-probing it. On the fallback path the estimate seed is a stratified sector × market-cap sample (√-weighted Hamilton quota, liquidity-ranked within cells, hash tie-break) whose size is derived from the remaining call budget; `audit/seed-audit.json` states the selection basis. Before pool selection, the top lane candidates receive a `key-metrics-ttm` quality probe (ROIC, FCF yield, EV/FCF, leverage, SBC) and a probe-resolved row with SBC-adjusted FCF yield below 1% cannot enter any lane except `high_growth_exception`. Exact 20-day ADDV work is prioritized by the four economic lanes, not by ticker order. Read `references/claude-code-execution.md` and `references/migration-v3.6-to-v3.6.1.md` for the full execution contract.
